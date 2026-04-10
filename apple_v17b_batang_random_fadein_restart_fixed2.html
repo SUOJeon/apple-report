@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>(사과) 가루화 v17b · 바탕체 계열 · 무작위 분산</title>
+  <style>
+    html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; touch-action:manipulation; -webkit-user-select:none; user-select:none; }
+    body { opacity:0; }
+    canvas { display:block; width:100vw; height:100vh; }
+  </style>
+</head>
+<body>
+  <canvas id="cv"></canvas>
+
+<script>
+"use strict";
+
+// fade timing
+const HOLD_MS = 700;
+const FADE_MS = 1800;
+
+function fadeInBody(){
+  document.body.style.transition = `opacity ${FADE_MS}ms ease`;
+  requestAnimationFrame(() => {
+    document.body.style.opacity = "1";
+  });
+}
+
+
+(function(){
+  const DPR = Math.max(1, Math.min(2.5, window.devicePixelRatio || 1));
+  const canvas = document.getElementById('cv');
+  const ctx = canvas.getContext('2d', { alpha:false });
+  if(!ctx){ return; }
+
+  let W=0, H=0, RAF=0;
+  let startTime = 0;
+  let phase = 0; // 0=float text, 1=explode/drift
+
+  const WORD = "(사과)";
+  const FONT_PT = 12;
+  const FONT_PX = FONT_PT * (96/72);
+  // ★ 바탕체 계열 우선 스택
+  const FONT = `"Batang","바탕","바탕체","Nanum Myeongjo","Noto Serif KR","Times New Roman",serif`;
+
+  const texts = [];
+  const particles = [];
+  let cachedOffsets = null;
+
+  // Reduction by exit-only
+  const RAMP_MS = 15000;         // 15초 내 200 -> 100
+  const PERSISTENT_INIT = 200;   // 최초 유지 개수(대략)
+  const PERSISTENT_FINAL = 100;  // 안정화 목표 개수
+  let persistentCount = 0;       // 현재 화면 안 persistent 개수
+
+  function coldStart(){
+    cancelAnimationFrame(RAF);
+    document.body.style.transition = "none";
+    document.body.style.opacity = "0";
+    setTimeout(() => {
+      init();
+      fadeInBody();
+    }, HOLD_MS);
+  }
+
+  function restartWithFade(){
+    cancelAnimationFrame(RAF);
+    document.body.style.transition = "none";
+    document.body.style.opacity = "0";
+    setTimeout(() => {
+      init();
+      fadeInBody();
+    }, 60);
+  }
+
+
+  // Stronger shatter params + 무작위 분산
+  const BOOST_FRAC = 0.22;        // 더 멀리 튀는 비율
+  const BOOST_MIN = 2.2, BOOST_MAX = 4.2;
+  const STEP_BIAS = -1;           // stride를 1 줄여 더 촘촘하게(최소치는 유지)
+  const EXTRA_DUP = 0.12;         // 확률로 샘플 1개 추가 생성 (미세 지터)
+
+  function clampCanvasSize(){
+    const maxSide = 4096;
+    const w = Math.min(Math.floor(innerWidth * DPR), maxSide);
+    const h = Math.min(Math.floor(innerHeight * DPR), maxSide);
+    canvas.width = w; canvas.height = h;
+    W = w; H = h;
+  }
+
+  function init(){
+    cancelAnimationFrame(RAF);
+    clampCanvasSize();
+    startTime = performance.now();
+    phase = 0;
+    texts.length = 0;
+    particles.length = 0;
+    cachedOffsets = null;
+    persistentCount = 0;
+
+    for(let i=0;i<22;i++) texts.push(makeSprite());
+    seedBg();
+    loop();
+  }
+
+  function makeSprite(){
+    const order=[0,1,2,3];
+    for(let j=order.length-1;j>0;j--){ const k=(Math.random()*(j+1))|0; [order[j],order[k]]=[order[k],order[j]]; }
+    return {
+      x: Math.random()*(W-200*DPR)+100*DPR,
+      y: Math.random()*(H-160*DPR)+80*DPR,
+      vx: (Math.random()-0.5)*0.08*DPR,
+      vy: (Math.random()-0.5)*0.08*DPR,
+      rot: (Math.random()-0.5)*0.06,
+      rotV: (Math.random()-0.5)*0.003,
+      popped:[false,false,false,false],
+      order,
+      nextPopAt: 0,
+      gap: 220 + Math.random()*800,
+      done:false
+    };
+  }
+
+  function measureCharOffsets(){
+    if(cachedOffsets) return cachedOffsets;
+    const off = document.createElement('canvas');
+    const octx = off.getContext('2d');
+    const px = Math.round(FONT_PX * DPR);
+    octx.font = `400 ${px}px ${FONT}`;
+    const arr = WORD.split('');
+    const widths = arr.map(ch => Math.max(1, Math.ceil(octx.measureText(ch).width || px)));
+    let acc=0, offs=[];
+    for(const w of widths){ offs.push(acc); acc += w + 2*DPR; }
+    const total=acc;
+    for(let i=0;i<offs.length;i++) offs[i]-=total/2;
+    cachedOffsets = offs;
+    return offs;
+  }
+
+  function computeStride(){
+    const area = (W * H);
+    const scale = Math.sqrt((area * DPR) / (1.2e6));
+    const base = 2.2; // 적당히 촘촘
+    let stride = Math.round(base * Math.max(1, scale));
+    stride = Math.max(2, Math.min(stride, 7));
+    stride = Math.max(2, Math.min(7, stride + STEP_BIAS)); // 촘촘화
+    return stride;
+  }
+
+  function emitParticlesFromChar(sp, idx){
+    const px = Math.round(FONT_PX * DPR);
+    const off = document.createElement('canvas');
+    const octx = off.getContext('2d');
+    const w = Math.ceil(px*1.6), h = Math.ceil(px*2.0);
+    off.width = w; off.height = h;
+    octx.fillStyle = "#fff";
+    octx.textBaseline = "alphabetic";
+    octx.font = `400 ${px}px ${FONT}`;
+    octx.fillText(WORD[idx], Math.floor(px*0.2), Math.floor(px*1.1));
+
+    let img;
+    try { img = octx.getImageData(0,0,w,h).data; }
+    catch(e){ return; }
+
+    const offsets = measureCharOffsets();
+    const ox = offsets[idx];
+    const step = computeStride();
+
+    for(let y=0; y<h; y+=step){
+      for(let x=0; x<w; x+=step){
+        const a = img[(y*w + x)*4 + 3];
+        if(a>90){
+          placeShard(sp, ox, w, h, x, y, false);
+          if(Math.random() < EXTRA_DUP){
+            placeShard(sp, ox, w, h, x + (Math.random()-0.5)*step, y + (Math.random()-0.5)*step, true);
+          }
+        }
+      }
+    }
+  }
+
+  function placeShard(sp, ox, w, h, x, y, jitter){
+    const rx = (x - w/2) + ox;
+    const ry = (y - h*0.75);
+    const cosr = Math.cos(sp.rot), sinr = Math.sin(sp.rot);
+    const gx = sp.x + (rx*cosr - ry*sinr);
+    const gy = sp.y + (rx*sinr + ry*cosr);
+
+    let baseSize = (1.3 + Math.random()*0.9) * DPR;
+    if(Math.random() < 0.45) baseSize *= 0.5;
+    const size = Math.max(0.5*DPR, baseSize);
+
+    // === 무작위 분산: 각도/속도에 더 강한 랜덤성, 측면 마이크로 킥 ===
+    let ang = Math.atan2(gy - sp.y, gx - sp.x);
+    if (Math.random() < 0.35) {
+      ang += (Math.random()*Math.PI*2 - Math.PI); // 완전 자유 산포
+    } else {
+      ang += (Math.random()-0.5)*1.6; // 더 넓은 지터
+    }
+    let spd = (1.2 + Math.random()*2.2) * DPR;
+    spd *= (0.55 + Math.pow(Math.random(), 1.5) * 2.0); // heavy-tailed
+    if(Math.random() < BOOST_FRAC){
+      spd *= (BOOST_MIN + Math.random()*(BOOST_MAX - BOOST_MIN));
+    }
+    const lateral = (Math.random()-0.5) * 0.6 * DPR;
+    let bx = Math.cos(ang)*spd + Math.cos(ang + Math.PI/2) * lateral;
+    let by = Math.sin(ang)*spd + Math.sin(ang + Math.PI/2) * lateral - Math.random()*0.18*DPR;
+
+    const jitterStep = Math.max(2, computeStride());
+    const jx = jitter ? (Math.random()-0.5)*jitterStep : 0;
+    const jy = jitter ? (Math.random()-0.5)*jitterStep : 0;
+
+    // 최초 200개는 persistent로 마크
+    const persistent = persistentCount < PERSISTENT_INIT;
+    if(persistent) persistentCount++;
+
+    particles.push({
+      x: gx + jx, y: gy + jy,
+      bx, by,
+      vx: 0, vy: 0,
+      size,
+      hold: 6 + ((Math.random()*8)|0),
+      migrated: false,
+      persistent
+    });
+  }
+
+  function allowedPersistent(now){
+    const p = Math.max(0, Math.min(1, (now - startTime)/RAMP_MS));
+    return Math.round((1 - p) * PERSISTENT_INIT + p * PERSISTENT_FINAL);
+  }
+
+  function targetSpeed(){ return 0.00105 * Math.min(W,H); } // px/frame
+
+  function updateParticles(now){
+    const allow = allowedPersistent(now);
+    const tSpeed = targetSpeed();
+
+    for(let i=particles.length-1;i>=0;i--){
+      const s = particles[i];
+      if(s.hold>0){ s.hold--; }
+      else{
+        if(!s.migrated){
+          const vmag0 = Math.hypot(s.bx, s.by);
+          if(vmag0>0){ s.vx=s.bx; s.vy=s.by; }
+          else { const th=Math.random()*Math.PI*2; s.vx=Math.cos(th)*0.6; s.vy=Math.sin(th)*0.6; }
+          s.migrated = true;
+        }
+        // 저속 수렴
+        const vmag = Math.hypot(s.vx, s.vy) || 1e-6;
+        const p = Math.max(0, Math.min(1, (now - startTime)/RAMP_MS));
+        const slow = (1 - p) * vmag + p * tSpeed;
+        const scale = slow / vmag;
+        s.vx *= scale; s.vy *= scale;
+
+        s.x += s.vx; s.y += s.vy;
+      }
+
+      // 경계 처리: persistent는 wrap 또는 제거, non-persistent는 제거
+      const pad=24;
+      let out = (s.x < -pad) || (s.x > W+pad) || (s.y < -pad) || (s.y > H+pad);
+      if(out){
+        if(s.persistent){
+          if(persistentCount > allow){
+            particles.splice(i,1);
+            persistentCount--;
+            continue;
+          } else {
+            if(s.x < -pad) s.x = W+pad;
+            else if(s.x > W+pad) s.x = -pad;
+            if(s.y < -pad) s.y = H+pad;
+            else if(s.y > H+pad) s.y = -pad;
+          }
+        } else {
+          particles.splice(i,1);
+          continue;
+        }
+      }
+    }
+  }
+
+  function drawParticles(){
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "rgba(0,0,0,0.14)";
+    ctx.fillRect(0,0,W,H);
+
+    ctx.globalCompositeOperation = "lighter";
+    for(const s of particles){
+      const r = s.size*3.0;
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r);
+      g.addColorStop(0, `rgba(255,255,255,0.24)`);
+      g.addColorStop(1, `rgba(255,255,255,0.05)`);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.globalCompositeOperation = "source-over";
+    for(const s of particles){
+      ctx.fillStyle = `rgba(255,255,255,0.92)`;
+      const r = s.size * 0.55;
+      ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, Math.PI*2); ctx.fill();
+    }
+  }
+
+  function drawTexts(){
+    ctx.save();
+    ctx.fillStyle = "#fff";
+    ctx.textBaseline = "alphabetic";
+    ctx.textAlign = "left";
+    ctx.font = `${Math.round(FONT_PX*DPR)}px ${FONT}`;
+    const offs = measureCharOffsets();
+    for(const sp of texts){
+      ctx.translate(sp.x, sp.y);
+      ctx.rotate(sp.rot);
+      for(let i=0;i<WORD.length;i++){
+        if(sp.popped[i]) continue;
+        ctx.fillText(WORD[i], offs[i], Math.round(FONT_PX*DPR*0.1));
+      }
+      ctx.rotate(-sp.rot);
+      ctx.translate(-sp.x, -sp.y);
+    }
+    ctx.restore();
+  }
+
+  function updateTexts(){
+    for(const sp of texts){
+      sp.x += sp.vx; sp.y += sp.vy;
+      sp.rot += sp.rotV;
+    }
+  }
+
+  function schedulePops(){
+    const now = performance.now();
+    for(const sp of texts){
+      if(!sp.nextPopAt) sp.nextPopAt = now + Math.random()*800;
+      if(now >= sp.nextPopAt){
+        let fired=false;
+        for(const idx of sp.order){
+          if(!sp.popped[idx]){
+            sp.popped[idx] = true;
+            emitParticlesFromChar(sp, idx);
+            fired=true;
+            sp.nextPopAt = now + sp.gap * (0.5 + Math.random());
+            break;
+          }
+        }
+        if(!fired) sp.done=true;
+      }
+    }
+    for(let i=texts.length-1;i>=0;i--){
+      if(texts[i].done) texts.splice(i,1);
+    }
+  }
+
+  const bgStars = [];
+  function seedBg(){
+    bgStars.length=0;
+    const N = Math.max(30, Math.floor((W*H)/(14000/DPR)));
+    for(let i=0;i<N;i++){
+      bgStars.push({ x: Math.random()*W, y: Math.random()*H, tw: Math.random()*Math.PI*2, sp: 0.0008 + Math.random()*0.002 });
+    }
+  }
+  function drawBg(){
+    for(const s of bgStars){
+      s.tw += s.sp;
+      const a = 18 + 14*Math.sin(s.tw);
+      ctx.fillStyle = `rgba(255,255,255,${a/255})`;
+      ctx.fillRect(s.x, s.y, 1, 1);
+    }
+  }
+
+  function loop(){
+    const now = performance.now();
+    ctx.fillStyle = "#000"; ctx.fillRect(0,0,W,H);
+    drawBg();
+
+    if(phase===0){
+      drawTexts();
+      updateTexts();
+      if(now - startTime > 4000) phase = 1;
+    } else {
+      drawTexts();
+      updateTexts();
+      schedulePops();
+      updateParticles(now);
+      drawParticles();
+    }
+
+    RAF = requestAnimationFrame(loop);
+  }
+
+  // Invisible controls: restart by tap / space / left-click
+  function restart(){ restartWithFade(); }
+  addEventListener('keydown', e => { if(e.code==='Space'){ e.preventDefault(); restart(); } });
+  addEventListener('mousedown', e => { if(e.button===0) restart(); });
+  addEventListener('touchstart', e => { if(e.touches && e.touches.length===1){ e.preventDefault(); restart(); } }, {passive:false});
+
+  addEventListener('resize', () => { coldStart(); }, {passive:true});
+
+  coldStart();
+})();
+</script>
+</body>
+</html>
